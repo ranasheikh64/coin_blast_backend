@@ -72,4 +72,16 @@ process.on('unhandledRejection', (reason) => {
 
 const PORT = process.env.PORT || 5000;
 
-// Connect to Database and start server locally (on Vercel, serverless handles req
+// Connect to Database and start server locally (on Vercel, serverless handles requests without app.listen)
+if (!process.env.VERCEL) {
+  connectDB().then(() => {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 Coin Blast Server running on port ${PORT}`);
+    });
+  }).catch((err) => {
+    console.error('Failed to start server:', err);
+  });
+}
+
+module.exports = app;
+
