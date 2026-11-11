@@ -44,3 +44,4 @@ const CoinTransactionSchema = new mongoose.Schema(
 CoinTransactionSchema.index({ type: 1, referenceId: 1 }, { unique: true });
 
 module.exports = mongoose.model('CoinTransaction', CoinTransactionSchema);
+

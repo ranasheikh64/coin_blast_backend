@@ -50,3 +50,4 @@ const AdRewardSchema = new mongoose.Schema(
 );
 
 module.exports = mongoose.model('AdReward', AdRewardSchema);
+

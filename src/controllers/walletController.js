@@ -130,11 +130,23 @@ exports.requestCashout = async (req, res) => {
       });
     }
 
-    // 6. Verify gateway availability BEFORE deducting
+    // 6. Verify gateway availability BEFORE deducting (supports LNbits, Blink, or ZEBEDEE)
+    const hasLnbitsKey = Boolean(
+      process.env.LNBITS_BASE_URL &&
+        process.env.LNBITS_BASE_URL.trim() &&
+        process.env.LNBITS_ADMIN_KEY &&
+        process.env.LNBITS_ADMIN_KEY.trim()
+    );
+    const hasBlinkKey = Boolean(
+      process.env.BLINK_API_KEY &&
+        process.env.BLINK_API_KEY.trim() &&
+        process.env.BLINK_WALLET_ID &&
+        process.env.BLINK_WALLET_ID.trim()
+    );
     const hasZbdKey = Boolean(process.env.ZEBEDEE_API_KEY && process.env.ZEBEDEE_API_KEY.trim());
     const allowSim = process.env.ALLOW_SIMULATED_CASHOUT === 'true';
 
-    if (!hasZbdKey && !allowSim) {
+    if (!hasLnbitsKey && !hasBlinkKey && !hasZbdKey && !allowSim) {
       return res.status(503).json({
         success: false,
         message: 'Payout gateway is currently configuring. Please try again later.',
@@ -168,27 +180,129 @@ exports.requestCashout = async (req, res) => {
     let txId = `SIM_LN_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     let gatewayResponse = { simulated: true, note: 'Simulated test payout' };
 
-    if (hasZbdKey) {
+    if (hasLnbitsKey || hasBlinkKey || hasZbdKey) {
       try {
-        const zbdResponse = await axios.post(
-          'https://api.zebedee.io/v0/ln-address/send-payment',
-          {
-            lnAddress: cleanAddr,
-            amount: (satoshisToCashout * 1000).toString(), // millisatoshis
-            comment: 'Coin Blast Game Reward Cashout',
-          },
-          {
-            headers: {
-              'Content-Type': 'application/json',
-              apikey: process.env.ZEBEDEE_API_KEY.trim(),
-            },
-            timeout: 15000,
+        if (hasLnbitsKey) {
+          // 100% Permissionless LNbits Lightning API (No KYC / No phone / No country blocks)
+          const [lnUser, lnDomain] = cleanAddr.split('@');
+          const lnurlInfoRes = await axios.get(
+            `https://${lnDomain}/.well-known/lnurlp/${encodeURIComponent(lnUser)}`,
+            { timeout: 10000 }
+          );
+
+          const lnInfo = lnurlInfoRes.data;
+          if (!lnInfo || !lnInfo.callback) {
+            throw new Error('Recipient Lightning Address could not be resolved');
           }
-        );
-        txId = zbdResponse.data?.data?.id || txId;
-        gatewayResponse = zbdResponse.data;
-      } catch (zbdErr) {
-        console.error('ZEBEDEE API Error:', zbdErr.response?.data || zbdErr.message);
+
+          const amountMsat = satoshisToCashout * 1000;
+          if (
+            (lnInfo.minSendable && amountMsat < lnInfo.minSendable) ||
+            (lnInfo.maxSendable && amountMsat > lnInfo.maxSendable)
+          ) {
+            throw new Error('Cashout amount outside recipient wallet limits');
+          }
+
+          const descriptionHash = crypto
+            .createHash('sha256')
+            .update(String(lnInfo.metadata || ''))
+            .digest('hex');
+
+          const lnbitsPayload = {
+            description_hash: descriptionHash,
+            callback: lnInfo.callback,
+            amount: amountMsat,
+          };
+          if (lnInfo.commentAllowed && lnInfo.commentAllowed > 0) {
+            lnbitsPayload.comment = 'Coin Blast Reward Cashout'.slice(0, lnInfo.commentAllowed);
+          }
+
+          const lnbitsBase = process.env.LNBITS_BASE_URL.trim().replace(/\/+$/, '');
+          const lnbitsPayRes = await axios.post(
+            `${lnbitsBase}/api/v1/payments/lnurl`,
+            lnbitsPayload,
+            {
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Api-Key': process.env.LNBITS_ADMIN_KEY.trim(),
+              },
+              timeout: 45000,
+            }
+          );
+
+          txId = lnbitsPayRes.data?.payment_hash || `LNBITS_${Date.now()}`;
+          gatewayResponse = lnbitsPayRes.data;
+        } else if (hasBlinkKey) {
+          // Blink (Galoy) Lightning API
+          const blinkRes = await axios.post(
+            'https://api.blink.sv/graphql',
+            {
+              query: `
+                mutation LnAddressPaymentSend($input: LnAddressPaymentSendInput!) {
+                  lnAddressPaymentSend(input: $input) {
+                    status
+                    errors {
+                      code
+                      message
+                      path
+                    }
+                  }
+                }
+              `,
+              variables: {
+                input: {
+                  walletId: process.env.BLINK_WALLET_ID.trim(),
+                  amount: satoshisToCashout,
+                  lnAddress: cleanAddr,
+                },
+              },
+            },
+            {
+              headers: {
+                'Content-Type': 'application/json',
+                'X-API-KEY': process.env.BLINK_API_KEY.trim(),
+              },
+              timeout: 15000,
+            }
+          );
+
+          const payload = blinkRes.data?.data?.lnAddressPaymentSend;
+          const gqlErrors = blinkRes.data?.errors || payload?.errors || [];
+          if (
+            gqlErrors.length > 0 ||
+            !payload ||
+            (payload.status !== 'SUCCESS' && payload.status !== 'PENDING')
+          ) {
+            const errMsg =
+              gqlErrors[0]?.message || `Blink payout failed (${payload?.status || 'UNKNOWN'})`;
+            throw new Error(errMsg);
+          }
+
+          txId = `BLINK_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+          gatewayResponse = blinkRes.data;
+        } else {
+          // ZEBEDEE (ZBD) Lightning API
+          const zbdResponse = await axios.post(
+            'https://api.zebedee.io/v0/ln-address/send-payment',
+            {
+              lnAddress: cleanAddr,
+              amount: (satoshisToCashout * 1000).toString(), // millisatoshis
+              comment: 'Coin Blast Game Reward Cashout',
+            },
+            {
+              headers: {
+                'Content-Type': 'application/json',
+                apikey: process.env.ZEBEDEE_API_KEY.trim(),
+              },
+              timeout: 15000,
+            }
+          );
+          txId = zbdResponse.data?.data?.id || txId;
+          gatewayResponse = zbdResponse.data;
+        }
+      } catch (gatewayErr) {
+        const errMsg = gatewayErr.response?.data?.message || gatewayErr.message;
+        console.error('Lightning Gateway Error:', gatewayErr.response?.data || errMsg);
 
         // 8. Automatic atomic refund so ZERO coins are lost on gateway failure!
         await refundCashout({
@@ -196,7 +310,7 @@ exports.requestCashout = async (req, res) => {
           amount: pointsToDeduct,
           referenceId: cashoutRefId,
           previousCashoutDate,
-          metadata: { reason: zbdErr.response?.data?.message || zbdErr.message },
+          metadata: { reason: errMsg },
         });
 
         await Cashout.create({
@@ -206,7 +320,7 @@ exports.requestCashout = async (req, res) => {
           lightningAddress: cleanAddr,
           status: 'failed',
           txId: cashoutRefId,
-          gatewayResponse: zbdErr.response?.data || { error: zbdErr.message },
+          gatewayResponse: gatewayErr.response?.data || { error: errMsg },
         });
 
         return res.status(502).json({
