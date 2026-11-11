@@ -8,6 +8,10 @@ const GameSessionSchema = new mongoose.Schema(
       unique: true,
       index: true,
     },
+    sessionNonce: {
+      type: String,
+      required: true,
+    },
     userId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
@@ -38,12 +42,16 @@ const GameSessionSchema = new mongoose.Schema(
     },
     minDurationSeconds: {
       type: Number,
-      default: 20, // Anti-cheat baseline threshold
+      default: 12, // Anti-cheat baseline threshold
     },
     status: {
       type: String,
-      enum: ['in_progress', 'completed', 'failed', 'cheated'],
+      enum: ['in_progress', 'processing', 'completed', 'failed', 'cheated'],
       default: 'in_progress',
+    },
+    signatureVerified: {
+      type: Boolean,
+      default: false,
     },
     completedAt: {
       type: Date,
